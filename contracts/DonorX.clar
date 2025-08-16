@@ -17,10 +17,17 @@
 (define-constant err-insufficient-target (err u108))
 (define-constant err-already-participated (err u109))
 (define-constant err-campaign-not-started (err u110))
+(define-constant err-invalid-endorsement (err u111))
+(define-constant err-self-endorsement (err u112))
+(define-constant err-already-endorsed (err u113))
+(define-constant err-endorsement-not-found (err u114))
+(define-constant err-invalid-reputation-tier (err u115))
 
 (define-data-var last-badge-id uint u0)
 (define-data-var donation-threshold uint u1)
 (define-data-var last-campaign-id uint u0)
+(define-data-var endorsement-weight uint u10)
+(define-data-var reputation-decay-period uint u52560)
 
 (define-map donor-records 
     principal 
@@ -28,7 +35,10 @@
         donations: uint,
         last-donation: uint,
         verified: bool,
-        badge-id: (optional uint)
+        badge-id: (optional uint),
+        reputation-score: uint,
+        endorsement-count: uint,
+        last-reputation-update: uint
     }
 )
 
@@ -54,6 +64,26 @@
 (define-map campaign-participants
     { campaign-id: uint, participant: principal }
     { donation-amount: uint, timestamp: uint }
+)
+
+(define-map donor-endorsements
+    { endorser: principal, endorsed: principal }
+    { 
+        endorsement-type: uint,
+        timestamp: uint,
+        message: (string-ascii 200),
+        weight: uint
+    }
+)
+
+(define-map reputation-tiers
+    uint
+    {
+        min-score: uint,
+        max-score: uint,
+        tier-name: (string-ascii 50),
+        benefits-multiplier: uint
+    }
 )
 
 (define-read-only (get-last-token-id)
@@ -117,9 +147,10 @@
 
 (define-public (record-donation (donor principal))
     (let (
-        (donor-data (default-to { donations: u0, last-donation: u0, verified: false, badge-id: none } 
+        (donor-data (default-to { donations: u0, last-donation: u0, verified: false, badge-id: none, reputation-score: u0, endorsement-count: u0, last-reputation-update: u0 } 
                                 (map-get? donor-records donor)))
         (current-block stacks-block-height)
+        (new-reputation (+ (get reputation-score donor-data) u5))
     )
         (asserts! (is-donation-center tx-sender) err-not-authorized)
         (asserts! (> current-block (+ (get last-donation donor-data) u8640)) err-already-verified)
@@ -128,7 +159,10 @@
             donations: (+ (get donations donor-data) u1),
             last-donation: current-block,
             verified: (get verified donor-data),
-            badge-id: (get badge-id donor-data)
+            badge-id: (get badge-id donor-data),
+            reputation-score: new-reputation,
+            endorsement-count: (get endorsement-count donor-data),
+            last-reputation-update: current-block
         })
         
         (try! (check-and-mint-badge donor))
@@ -143,7 +177,10 @@
             donations: u0,
             last-donation: u0,
             verified: true,
-            badge-id: none
+            badge-id: none,
+            reputation-score: u10,
+            endorsement-count: u0,
+            last-reputation-update: stacks-block-height
         }))
     )
 )
@@ -317,3 +354,202 @@
         })
     )
 )
+
+(define-public (endorse-donor (endorsed principal) (endorsement-type uint) (message (string-ascii 200)))
+    (let (
+        (endorsement-key { endorser: tx-sender, endorsed: endorsed })
+        (existing-endorsement (map-get? donor-endorsements endorsement-key))
+        (endorsed-data (unwrap! (map-get? donor-records endorsed) err-invalid-donor))
+        (current-block stacks-block-height)
+        (endorsement-weight-value (var-get endorsement-weight))
+        (new-reputation (+ (get reputation-score endorsed-data) endorsement-weight-value))
+    )
+        (asserts! (is-donation-center tx-sender) err-not-authorized)
+        (asserts! (not (is-eq tx-sender endorsed)) err-self-endorsement)
+        (asserts! (is-none existing-endorsement) err-already-endorsed)
+        (asserts! (and (>= endorsement-type u1) (<= endorsement-type u5)) err-invalid-endorsement)
+        
+        (map-set donor-endorsements endorsement-key {
+            endorsement-type: endorsement-type,
+            timestamp: current-block,
+            message: message,
+            weight: endorsement-weight-value
+        })
+        
+        (map-set donor-records endorsed
+            (merge endorsed-data {
+                reputation-score: new-reputation,
+                endorsement-count: (+ (get endorsement-count endorsed-data) u1),
+                last-reputation-update: current-block
+            })
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (revoke-endorsement (endorsed principal))
+    (let (
+        (endorsement-key { endorser: tx-sender, endorsed: endorsed })
+        (existing-endorsement (unwrap! (map-get? donor-endorsements endorsement-key) err-endorsement-not-found))
+        (endorsed-data (unwrap! (map-get? donor-records endorsed) err-invalid-donor))
+        (current-block stacks-block-height)
+        (endorsement-weight-value (get weight existing-endorsement))
+        (current-reputation (get reputation-score endorsed-data))
+        (new-reputation (if (>= current-reputation endorsement-weight-value)
+                           (- current-reputation endorsement-weight-value)
+                           u0))
+    )
+        (asserts! (is-donation-center tx-sender) err-not-authorized)
+        
+        (map-delete donor-endorsements endorsement-key)
+        
+        (map-set donor-records endorsed
+            (merge endorsed-data {
+                reputation-score: new-reputation,
+                endorsement-count: (if (> (get endorsement-count endorsed-data) u0)
+                                     (- (get endorsement-count endorsed-data) u1)
+                                     u0),
+                last-reputation-update: current-block
+            })
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (initialize-reputation-tiers)
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        
+        (map-set reputation-tiers u1 {
+            min-score: u0,
+            max-score: u49,
+            tier-name: "Bronze Donor",
+            benefits-multiplier: u100
+        })
+        
+        (map-set reputation-tiers u2 {
+            min-score: u50,
+            max-score: u149,
+            tier-name: "Silver Donor",
+            benefits-multiplier: u150
+        })
+        
+        (map-set reputation-tiers u3 {
+            min-score: u150,
+            max-score: u299,
+            tier-name: "Gold Donor",
+            benefits-multiplier: u200
+        })
+        
+        (map-set reputation-tiers u4 {
+            min-score: u300,
+            max-score: u499,
+            tier-name: "Platinum Donor",
+            benefits-multiplier: u250
+        })
+        
+        (map-set reputation-tiers u5 {
+            min-score: u500,
+            max-score: u999999,
+            tier-name: "Diamond Donor",
+            benefits-multiplier: u300
+        })
+        
+        (ok true)
+    )
+)
+
+(define-read-only (get-donor-reputation-tier (donor principal))
+    (let (
+        (donor-data (unwrap! (map-get? donor-records donor) err-invalid-donor))
+        (reputation-score (get reputation-score donor-data))
+    )
+        (if (<= reputation-score u49)
+            (ok (map-get? reputation-tiers u1))
+            (if (<= reputation-score u149)
+                (ok (map-get? reputation-tiers u2))
+                (if (<= reputation-score u299)
+                    (ok (map-get? reputation-tiers u3))
+                    (if (<= reputation-score u499)
+                        (ok (map-get? reputation-tiers u4))
+                        (ok (map-get? reputation-tiers u5))
+                    )
+                )
+            )
+        )
+    )
+)
+
+(define-read-only (get-donor-endorsements (endorsed principal))
+    (let (
+        (donor-data (map-get? donor-records endorsed))
+    )
+        (ok {
+            donor-data: donor-data,
+            endorsement-count: (match donor-data
+                                 some-data (get endorsement-count some-data)
+                                 u0)
+        })
+    )
+)
+
+(define-read-only (get-endorsement-details (endorser principal) (endorsed principal))
+    (ok (map-get? donor-endorsements { endorser: endorser, endorsed: endorsed }))
+)
+
+(define-private (calculate-reputation-decay (donor principal))
+    (let (
+        (donor-data (unwrap! (map-get? donor-records donor) u0))
+        (current-block stacks-block-height)
+        (last-update (get last-reputation-update donor-data))
+        (blocks-passed (- current-block last-update))
+        (decay-period (var-get reputation-decay-period))
+        (current-reputation (get reputation-score donor-data))
+    )
+        (if (>= blocks-passed decay-period)
+            (let (
+                (decay-amount (/ current-reputation u10))
+                (new-reputation (if (>= current-reputation decay-amount)
+                                  (- current-reputation decay-amount)
+                                  u0))
+            )
+                new-reputation
+            )
+            current-reputation
+        )
+    )
+)
+
+(define-public (update-reputation-decay (donor principal))
+    (let (
+        (donor-data (unwrap! (map-get? donor-records donor) err-invalid-donor))
+        (new-reputation (calculate-reputation-decay donor))
+        (current-block stacks-block-height)
+    )
+        (map-set donor-records donor
+            (merge donor-data {
+                reputation-score: new-reputation,
+                last-reputation-update: current-block
+            })
+        )
+        (ok new-reputation)
+    )
+)
+
+(define-public (set-endorsement-weight (new-weight uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (ok (var-set endorsement-weight new-weight))
+    )
+)
+
+(define-public (set-reputation-decay-period (new-period uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (ok (var-set reputation-decay-period new-period))
+    )
+)
+
+
