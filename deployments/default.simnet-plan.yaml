@@ -54,4 +54,9 @@ plan:
             emulated-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
             path: "contracts\\DonorX.clar"
             clarity-version: 3
+        - emulated-contract-publish:
+            contract-name: blood-compatibility
+            emulated-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
+            path: "contracts\\blood-compatibility.clar"
+            clarity-version: 3
       epoch: "3.1"
